@@ -1,28 +1,16 @@
 #!/usr/bin/env bash
+# install/modules/waf-apache.sh - Apache + ModSecurity2 + latest CRS + the WafControl panel vhost.
+#
+# Inputs (environment): APP_DIR VENV_DIR RUNTIME_DIR MODE [HTTP_PORT DOMAIN SSL_ENABLE
+# CERTBOT_EMAIL BASIC_AUTH_*]. With INSTALL_TARGET=docker nothing is started or reloaded.
 set -euo pipefail
-
-is_tty=0; [ -t 1 ] && is_tty=1
-if [ "$is_tty" -eq 1 ]; then
-  GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; BLUE='\033[1;34m'; NC='\033[0m'
-else
-  GREEN=''; YELLOW=''; RED=''; BLUE=''; NC=''
-fi
-say()  { printf "%b[+]%b %s\n" "$GREEN" "$NC" "$*"; }
-warn() { printf "%b[!]%b %s\n" "$YELLOW" "$NC" "$*" >&2; }
-err()  { printf "%b[x]%b %s\n" "$RED" "$NC" "$*" >&2; }
-line() { local ch="${1:-=}"; local w="${2:-72}"; printf '%*s\n' "$w" '' | tr ' ' "$ch"; }
-banner(){ local title="$1"; local ch="${2:-=}"; local w="${3:-72}"; line "$ch" "$w"; printf "%b%s%b\n" "$BLUE" "$title" "$NC"; line "$ch" "$w"; }
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 
 trap 'err "Failed on line $LINENO"' ERR
-[[ $EUID -eq 0 ]] || { err "Run as root (sudo)."; exit 1; }
+require_root
 export DEBIAN_FRONTEND=noninteractive
-
-STATE_DIR="${STATE_DIR:-/var/lib/wafcontrol-installer}"
-STATE_FILE="${STATE_FILE:-$STATE_DIR/state.env}"
 mkdir -p "$STATE_DIR"; touch "$STATE_FILE"
-state_append_array() { printf '%s+=(%q)\n' "$1" "$2" >> "$STATE_FILE"; }
-state_put_map()      { printf '%s[%q]=%q\n' "$1" "$2" "$3" >> "$STATE_FILE"; }
-source "$STATE_FILE" 2>/dev/null || true
+state_load
 
 APP_DIR="${APP_DIR:?}"
 VENV_DIR="${VENV_DIR:?}"
@@ -44,7 +32,7 @@ if ! command -v apache2ctl >/dev/null 2>&1; then
   banner "Installing Apache"
   apt update -y
   apt install -y apache2
-  systemctl enable --now apache2
+  svc_enable_now apache2
   say "Apache installed and started."
 else
   say "Apache detected; reusing existing installation."
@@ -116,17 +104,20 @@ else
 fi
 
 RULES="${TGT}/rules"
-[[ -d "$RULES" ]] || { err "CRS rules dir not found: $RULES"; }
-[[ -f "${TGT}/crs-setup.conf" ]] || cp "${TGT}/crs-setup.conf.example" "${TGT}/crs-setup.conf"
+[[ -d "$RULES" ]] || { err "CRS rules dir not found: $RULES"; exit 1; }
+if [[ ! -f "${TGT}/crs-setup.conf" ]]; then
+  # Debian/Ubuntu's modsecurity-crs package keeps crs-setup.conf under /etc/modsecurity/crs.
+  for c in "${TGT}/crs-setup.conf.example" /etc/modsecurity/crs/crs-setup.conf /usr/share/doc/modsecurity-crs/examples/crs-setup.conf.example; do
+    [[ -f "$c" ]] && { cp "$c" "${TGT}/crs-setup.conf"; break; }
+  done
+fi
+[[ -f "${TGT}/crs-setup.conf" ]] || { err "crs-setup.conf not found for $(basename "$TGT")"; exit 1; }
 for f in REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf RESPONSE-999-EXCLUSION-RULES-AFTER-CRS.conf; do
   [[ -f "${RULES}/${f}" ]] || { [[ -f "${RULES}/${f}.example" ]] && cp "${RULES}/${f}.example" "${RULES}/${f}" || true; }
 done
-if [[ -f "${RULES}/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf" ]] && ! grep -q '/crs/rules/save/' "${RULES}/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf"; then
-  cat >> "${RULES}/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf" <<'EOR'
-SecRule REQUEST_URI "@beginsWith /crs/rules/save/"        "id:1500010,phase:1,nolog,pass,ctl:ruleEngine=Off"
-SecRule REQUEST_URI "@beginsWith /dashboard/crs/settings/" "id:1500011,phase:1,nolog,pass,ctl:ruleEngine=Off"
-EOR
-fi
+# Dashboard exclusions are scoped to the panel vhost (scripts/panel_waf_exclusions.sh), never global:
+# a global REQUEST_URI exclusion turned the WAF off for those paths on every protected site.
+sed -i -E '/id:15000(10|11)\b/d; /^# (WAF dashboard exclusions|Exclude WAF dashboard endpoints)$/d' "${RULES}/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf" 2>/dev/null || true
 
 ln -sfn "$TGT" "$CRS_CURRENT"
 chmod -R a+rX "$CRS_ROOT"
@@ -149,7 +140,7 @@ cat > "$SEC2" <<CONF
 CONF
 
 apache2ctl configtest
-systemctl reload apache2
+svc_reload apache2
 say "Apache WAF ready (CRS: $(basename "$TGT"))."
 
 banner "Creating Apache vhost for WafControl"
@@ -199,9 +190,9 @@ APX
 
   a2ensite wafcontrol.conf >/dev/null 2>&1 || true
   apache2ctl configtest
-  systemctl reload apache2
+  svc_reload apache2
 
-  if [[ "$SSL_ENABLE" -eq 1 ]]; then
+  if [[ "$SSL_ENABLE" -eq 1 ]] && ! is_docker_build; then
     say "Installing certbot and enabling SSL for $DOMAIN"
     apt install -y certbot python3-certbot-apache
     EMAIL="${CERTBOT_EMAIL:-admin@${DOMAIN}}"
@@ -242,8 +233,18 @@ APX
   a2enmod proxy proxy_http headers rewrite >/dev/null 2>&1 || true
   a2ensite wafcontrol.conf >/dev/null 2>&1 || true
   apache2ctl configtest
-  systemctl reload apache2
+  svc_reload apache2
 fi
 
 state_append_array CREATED_FILES "$APACHE_CONF"
+
+# Panel-only WAF exclusions: saving config text in the panel would otherwise be blocked by CRS.
+PANEL_EXCL="${APP_DIR}/scripts/panel_waf_exclusions.sh"
+if [[ -f "$PANEL_EXCL" ]]; then
+  WAFC_NO_RELOAD=1 bash "$PANEL_EXCL" || warn "Could not apply panel WAF exclusions; run $PANEL_EXCL."
+else
+  warn "This WafControl version has no scripts/panel_waf_exclusions.sh: saving config in the panel may be blocked (403)."
+fi
+apache2ctl configtest
+svc_reload apache2
 say "Apache vhost ready."

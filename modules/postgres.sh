@@ -1,27 +1,13 @@
 #!/usr/bin/env bash
+# install/modules/postgres.sh - reuse or install PostgreSQL, then create the WafControl role + database.
+# Inputs (environment): DB_NAME DB_USER DB_PASS [PG_VERSION DB_HOST DB_PORT]. Host installs only.
 set -euo pipefail
-
-is_tty=0; [ -t 1 ] && is_tty=1
-if [ "$is_tty" -eq 1 ]; then
-  GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; BLUE='\033[1;34m'; NC='\033[0m'
-else
-  GREEN=''; YELLOW=''; RED=''; BLUE=''; NC=''
-fi
-say()  { printf "%b[+]%b %s\n" "$GREEN" "$NC" "$*"; }
-warn() { printf "%b[!]%b %s\n" "$YELLOW" "$NC" "$*" >&2; }
-err()  { printf "%b[x]%b %s\n" "$RED" "$NC" "$*" >&2; }
-line() { local ch="${1:-=}"; local w="${2:-72}"; printf '%*s\n' "$w" '' | tr ' ' "$ch"; }
-banner(){ local title="$1"; local ch="${2:-=}"; local w="${3:-72}"; line "$ch" "$w"; printf "%b%s%b\n" "$BLUE" "$title" "$NC"; line "$ch" "$w"; }
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 
 trap 'err "Failed on line $LINENO"' ERR
-[[ $EUID -eq 0 ]] || { err "Run as root (sudo)."; exit 1; }
+require_root
 export DEBIAN_FRONTEND=noninteractive
-
-STATE_DIR="${STATE_DIR:-/var/lib/wafcontrol-installer}"
-STATE_FILE="${STATE_FILE:-$STATE_DIR/state.env}"
 mkdir -p "$STATE_DIR"; touch "$STATE_FILE"
-state_put_map()  { printf '%s[%q]=%q\n' "$1" "$2" "$3" >> "$STATE_FILE"; }
-state_put_flag() { printf 'FLAGS[%q]=%q\n' "$1" "$2" >> "$STATE_FILE"; }
 
 DB_NAME="${DB_NAME:?}"
 DB_USER="${DB_USER:?}"
@@ -43,7 +29,7 @@ pgdg_add_repo() {
 ensure_postgres() {
   local v="$1"
   apt install -y "postgresql-${v}" "postgresql-client-${v}" libpq-dev "postgresql-server-dev-${v}"
-  systemctl enable --now postgresql
+  svc_enable_now postgresql
   for _ in {1..60}; do pg_isready >/dev/null 2>&1 && break; sleep 1; done
 }
 
@@ -112,7 +98,7 @@ if ! sudo -u postgres psql -tAc "SELECT 1" >/dev/null 2>&1; then
   NEED_RESTORE=1
   sed -i -E 's/^(local[[:space:]]+all[[:space:]]+all[[:space:]]+).*/\1trust/' "$PG_HBA"
   sed -i -E 's/^(local[[:space:]]+all[[:space:]]+postgres[[:space:]]+).*/\1trust/' "$PG_HBA" || true
-  systemctl reload postgresql || systemctl restart postgresql
+  svc_reload postgresql
   sudo -u postgres psql -tAc "SELECT 1" >/dev/null 2>&1 || { err "psql inaccessible even after temporary trust"; exit 1; }
 fi
 line "-" 72
@@ -138,7 +124,7 @@ sudo -u postgres psql -v ON_ERROR_STOP=1 -c "GRANT ALL PRIVILEGES ON DATABASE ${
 if [[ $NEED_RESTORE -eq 1 ]]; then
   cp -f "${PG_HBA}.bak."* "$PG_HBA" 2>/dev/null || true
   sed -i -E 's/( scram-sha-256| trust)([[:space:]]|$)/ md5\2/g' "$PG_HBA" || true
-  systemctl reload postgresql || systemctl restart postgresql
+  svc_reload postgresql
 fi
 
 state_put_flag "pg_major" "$PG_VERSION"
