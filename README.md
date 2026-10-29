@@ -9,20 +9,81 @@ It simplifies installation, configuration, and operation of CRS and ModSecurity,
 ## Easy Install
 
 ```bash
-curl -fsSL https://wafcontrol.org/download/install.sh -o install.sh
-```
-
-```bash
+curl -fsSL https://raw.githubusercontent.com/aedkymish/install/main/install.sh -o install.sh
 chmod +x install.sh
-```
-
-```bash
 sudo ./install.sh
 ```
 
-When running from a checkout, the installer uses the modules in the adjacent
-`modules/` directory. Setting `MODULE_BASE` explicitly selects remote modules
-instead. A standalone downloaded `install.sh` fetches remote modules as before.
+Downloaded on its own, `install.sh` fetches the rest of the installer (`lib/`, `modules/`) from
+`INSTALLER_URL` and runs it. From a checkout of this repository it uses the local files:
+
+```bash
+git clone https://github.com/aedkymish/install.git && cd install
+sudo ./install.sh
+```
+
+The application is cloned from `REPO_URL` (default `https://github.com/aedkymish/wafcontrol.git`,
+branch `REPO_BRANCH`, default `main`), or copied from a local checkout with `APP_SRC=/path/to/wafcontrol`.
+
+### Unattended install
+
+Every question can be answered from the environment; `--yes` takes the defaults for the rest:
+
+```bash
+sudo SERVER=nginx MODE=ip HTTP_PORT=7000 DB_NAME=wafcontrol DB_USER=wafcontrol_user \
+     BASIC_AUTH_ENABLE=0 ./install.sh --yes
+```
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `SERVER` | `nginx` or `apache` | detected / asked |
+| `MODE` | `ip` or `domain` | `ip` |
+| `HTTP_PORT` | panel port in `ip` mode | `7000` |
+| `DOMAIN`, `SSL_ENABLE`, `CERTBOT_EMAIL` | `domain` mode, Let's Encrypt | |
+| `DB_NAME`, `DB_USER`, `DB_PASS`, `PG_VERSION` | PostgreSQL | `wafcontrol`, `wafcontrol_user`, generated, `18` |
+| `BASIC_AUTH_ENABLE`, `BASIC_AUTH_USER`, `BASIC_AUTH_PASS` | extra HTTP Basic Auth | off |
+| `APP_DIR`, `APP_SRC`, `REPO_URL`, `REPO_BRANCH` | where the application comes from / goes | `/opt/WafControl` |
+
+## Docker
+
+The image runs nginx (or Apache) + ModSecurity + CRS and the panel (Gunicorn, Celery worker and beat)
+under supervisord; PostgreSQL and Redis run in their own containers. It is built by the same
+`install.sh` (`--docker` mode: installs everything, starts nothing).
+
+```bash
+git clone https://github.com/aedkymish/install.git && cd install
+cp docker/.env.example .env        # set DB_PASS, the admin account and ALLOWED_HOSTS
+docker compose up -d --build       # Apache: docker compose -f docker-compose.apache.yml up -d --build
+```
+
+- Panel: `http://<host>:7000/` (admin from `DJANGO_SUPERUSER_*` in `.env`, created on first start).
+- Sites to protect: add their `server` blocks / virtual hosts from the panel; they are served on ports 80/443
+  of the container. Upstreams in other containers are reached by service name (`proxy_pass http://app:8080;`).
+- Persistent volumes: web server and ModSecurity/CRS configuration, logs (including the ModSecurity audit
+  log), PostgreSQL, Redis, and `/var/lib/wafcontrol` (`SECRET_KEY`, generated migrations).
+- Build the application from a local checkout instead of `REPO_URL`:
+  `docker build -t wafcontrol --build-context app=../wafcontrol .`
+- Requires a WafControl version where `CELERY_BROKER_URL` can be set from the environment.
+
+## Upgrade 1.0.0 → 1.1.0
+
+```bash
+git clone https://github.com/aedkymish/install.git && cd install
+sudo ./upgrade.sh            # --yes for no questions, --ref <tag|branch> for another version
+```
+
+1. Backs up the application (code, `.env`, migrations), the database (`pg_dump`) and the web server /
+   ModSecurity configuration to `/var/backups/wafcontrol/<date>-from-<version>/`.
+2. Fetches the new code (`REPO_URL`, default `https://github.com/aedkymish/wafcontrol.git`, ref `main`),
+   installs the Python requirements and runs `manage.py check`.
+3. Generates and applies the migrations (IP/Geo lists, attack request details) and collects static files.
+4. Replaces the global CRS exclusions of 1.0.0 (ids 1500010/1500011, which disabled the WAF on those paths
+   for **every** site) with panel-only exclusions, and makes the ModSecurity audit log writable by nginx.
+5. Restarts `wafcontrol`, `wafcontrol-celery-worker` and `wafcontrol-celery-beat` and checks them.
+
+If something fails before the migrations, the previous code is restored automatically. After that point,
+restore from the backup folder (`pg_restore --clean -d <db> db.dump`, `tar -xzf app.tar.gz -C /opt`).
+Docker: rebuild instead (`docker compose up -d --build`); migrations run when the container starts.
 
 ## Nginx / ModSecurity compatibility
 

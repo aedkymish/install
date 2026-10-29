@@ -1,60 +1,65 @@
 #!/usr/bin/env bash
+# install.sh - OWASP WafControl installer (Debian/Ubuntu).
+#
+#   sudo ./install.sh             guided install on this server (systemd)
+#   sudo ./install.sh --yes       same, unattended: answers come from the environment
+#   ./install.sh --docker         image build (used by the Dockerfile): installs the application,
+#                                 the web server and the WAF, starts nothing
+#
+# The application comes from APP_SRC (a local checkout) when set, otherwise it is cloned from
+# REPO_URL (branch REPO_BRANCH). Downloaded on its own, this script first fetches the rest of
+# the installer (INSTALLER_URL) and runs that copy. Every prompt can be preset in the environment.
 set -euo pipefail
 
-is_tty=0; [ -t 1 ] && is_tty=1
-if [ "$is_tty" -eq 1 ]; then
-  GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; BLUE='\033[1;34m'; NC='\033[0m'
-else
-  GREEN=''; YELLOW=''; RED=''; BLUE=''; NC=''
-fi
-say()  { printf "%b[+]%b %s\n" "$GREEN" "$NC" "$*"; }
-warn() { printf "%b[!]%b %s\n" "$YELLOW" "$NC" "$*" >&2; }
-err()  { printf "%b[x]%b %s\n" "$RED" "$NC" "$*" >&2; }
-ok()   { printf "%b[OK]%b %s\n" "$GREEN" "$NC" "$*"; }
-line() { local ch="${1:-=}"; local w="${2:-72}"; printf '%*s\n' "$w" '' | tr ' ' "$ch"; }
-banner(){ local title="$1"; local ch="${2:-=}"; local w="${3:-72}"; line "$ch" "$w"; printf "%b%s%b\n" "$BLUE" "$title" "$NC"; line "$ch" "$w"; }
-section(){ local title="$1"; printf "\n== %s ==\n" "$title"; }
+usage() {
+  sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+  cat <<'TXT'
+Options:
+  -y, --yes               non-interactive (NONINTERACTIVE=1)
+      --docker            image build mode (INSTALL_TARGET=docker, implies --yes)
+      --server NAME       nginx | apache (SERVER)
+  -h, --help              this help
+TXT
+}
 
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -y|--yes)   export NONINTERACTIVE=1 ;;
+    --docker)   export INSTALL_TARGET=docker ;;
+    --server)   export SERVER="${2:?--server needs nginx or apache}"; shift ;;
+    -h|--help)  usage; exit 0 ;;
+    *)          echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+APP_DIR="${APP_DIR:-/opt/WafControl}"
+APP_SRC="${APP_SRC:-}"
+REPO_URL="${REPO_URL:-https://github.com/aedkymish/wafcontrol.git}"
+REPO_BRANCH="${REPO_BRANCH:-main}"
+INSTALLER_URL="${INSTALLER_URL:-https://github.com/aedkymish/install.git}"
+INSTALLER_BRANCH="${INSTALLER_BRANCH:-main}"
+
+SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
+if [[ ! -f "$SELF_DIR/lib/common.sh" ]]; then
+  # Standalone download (curl ... -o install.sh): fetch the full installer, then run it.
+  [[ $EUID -eq 0 ]] || { echo "[x] Run as root (sudo)." >&2; exit 1; }
+  command -v git >/dev/null 2>&1 || { apt-get update -y && apt-get install -y --no-install-recommends git ca-certificates; }
+  INSTALLER_DIR="$(mktemp -d -t wafcontrol-installer-XXXXXX)"
+  echo "[+] Fetching installer ${INSTALLER_URL} (${INSTALLER_BRANCH})..."
+  git clone --depth 1 --branch "$INSTALLER_BRANCH" "$INSTALLER_URL" "$INSTALLER_DIR"
+  exec bash "$INSTALLER_DIR/install.sh" "$@"
+fi
+
+source "$SELF_DIR/lib/common.sh"
 trap 'err "Failed on line $LINENO"' ERR
-[[ $EUID -eq 0 ]] || { err "Run as root (sudo)."; exit 1; }
+require_root
 export DEBIAN_FRONTEND=noninteractive
 
-LOCAL_MODULE_DIR=""
-if [[ -z "${MODULE_BASE:-}" && -f "${BASH_SOURCE[0]:-}" ]]; then
-  LOCAL_MODULE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/modules"
-fi
-MODULE_BASE="${MODULE_BASE:-https://raw.githubusercontent.com/wafcontrol/install/refs/heads/main/modules/}"
-STATE_DIR="${STATE_DIR:-/var/lib/wafcontrol-installer}"
-STATE_FILE="${STATE_FILE:-$STATE_DIR/state.env}"
-
-state_bootstrap() {
-  mkdir -p "$STATE_DIR"
-  if ! grep -q 'STATE_VERSION=' "$STATE_FILE" 2>/dev/null; then
-    {
-      echo 'STATE_VERSION=2'
-      echo 'INSTALL_TIMESTAMP='"$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-      echo 'APP_DIR_DEFAULT=/opt/WafControl'
-      echo 'declare -a CREATED_FILES=()'
-      echo 'declare -a CREATED_UNITS=()'
-      echo 'declare -A BACKUPS=()'
-      echo 'declare -a CRS_DIRS=()'
-      echo 'declare -A FLAGS=()'
-    } > "$STATE_FILE"
-  fi
-}
-state_append_array() { printf '%s+=(%q)\n' "$1" "$2" >> "$STATE_FILE"; }
-state_put_flag()     { printf 'FLAGS[%q]=%q\n' "$1" "$2" >> "$STATE_FILE"; }
-
-fetch_and_run() {
+run_module() {
   local mod="${1:?module name required}"
-  if [[ -n "$LOCAL_MODULE_DIR" && -f "$LOCAL_MODULE_DIR/$mod" ]]; then
-    banner "Running local module: ${mod}"
-    bash "$LOCAL_MODULE_DIR/$mod"
-    return
-  fi
-  local url="${MODULE_BASE}/${mod}"
-  banner "Fetching module: ${mod}"
-  curl -fsSL "$url" | bash
+  banner "Running module: ${mod}"
+  bash "$SELF_DIR/modules/$mod"
 }
 
 detect_os() { . /etc/os-release 2>/dev/null || true; echo "${ID:-}"; }
@@ -64,10 +69,11 @@ detect_ubuntu() { [ "$(detect_os)" = "ubuntu" ]; }
 ensure_debian_sources() {
   local codename; codename="$(detect_codename)"
   local sources="/etc/apt/sources.list"
+  # Recent Debian images use deb822 sources; only fill in a missing classic list.
+  [[ -s "$sources" || -n "$(ls /etc/apt/sources.list.d/*.sources 2>/dev/null)" ]] && return 0
   case "$codename" in
     bullseye)
-      if [ ! -s "$sources" ]; then
-        cat > "$sources" <<'EOF'
+      cat > "$sources" <<'EOF'
 deb http://security.debian.org/debian-security bullseye-security main contrib non-free
 deb-src http://security.debian.org/debian-security bullseye-security main contrib
 
@@ -78,19 +84,15 @@ deb-src http://deb.debian.org/debian bullseye-updates main
 deb http://deb.debian.org/debian bullseye-backports main
 deb-src http://deb.debian.org/debian bullseye-backports main
 EOF
-        say "Created /etc/apt/sources.list for Debian 11 (bullseye)."
-      fi
+      say "Created /etc/apt/sources.list for Debian 11 (bullseye)."
       ;;
-    bookworm) : ;;
     trixie)
-      if [ ! -s "$sources" ]; then
-        cat > "$sources" <<'EOF'
+      cat > "$sources" <<'EOF'
 deb http://deb.debian.org/debian trixie main contrib non-free non-free-firmware
 deb http://deb.debian.org/debian trixie-updates main contrib non-free non-free-firmware
 deb http://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware
 EOF
-        say "Created /etc/apt/sources.list for Debian 13 (trixie)."
-      fi
+      say "Created /etc/apt/sources.list for Debian 13 (trixie)."
       ;;
     *) : ;;
   esac
@@ -120,14 +122,6 @@ ensure_python_ubuntu() {
       ;;
     *) : ;;
   esac
-}
-
-gen_pass() {
-  if command -v openssl >/dev/null 2>&1; then
-    openssl rand -base64 64 | tr -d '\n' | tr '/+=' '___' | tr -d "'" | cut -c1-50
-  else
-    LC_ALL=C tr -dc 'A-Za-z0-9!@#%^&*()_+=' </dev/urandom | head -c 50
-  fi
 }
 
 detect_webserver_choice() {
@@ -173,8 +167,8 @@ extract_port_from_conf() {
 dbname_is_valid() { [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; }
 dbuser_is_valid() { [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; }
 
+# ---------- Inputs (all can be preset in the environment) ----------
 APP_USER="${APP_USER:-wafcontrol}"
-APP_DIR="${APP_DIR:-/opt/WafControl}"
 VENV_DIR="${VENV_DIR:-$APP_DIR/venv}"
 RUNTIME_DIR="${RUNTIME_DIR:-/run/wafcontrol}"
 
@@ -182,22 +176,29 @@ SERVER="${SERVER:-}"
 MODE="${MODE:-}"
 DOMAIN="${DOMAIN:-}"
 HTTP_PORT="${HTTP_PORT:-}"
+SSL_ENABLE="${SSL_ENABLE:-}"
+CERTBOT_EMAIL="${CERTBOT_EMAIL:-}"
 
-DB_NAME="${DB_NAME:-wafcontrol}"
-DB_USER="${DB_USER:-wafcontrol_user}"
+DB_NAME="${DB_NAME:-}"
+DB_USER="${DB_USER:-}"
 DB_PASS="${DB_PASS:-}"
 DB_HOST="${DB_HOST:-127.0.0.1}"
 DB_PORT="${DB_PORT:-5432}"
 PG_VERSION="${PG_VERSION:-}"
-
 DEFAULT_PG_VER="${DEFAULT_PG_VER:-18}"
 
-BASIC_AUTH_ENABLE="${BASIC_AUTH_ENABLE:-0}"
+BASIC_AUTH_ENABLE="${BASIC_AUTH_ENABLE:-}"
 BASIC_AUTH_USER="${BASIC_AUTH_USER:-}"
 BASIC_AUTH_PASS="${BASIC_AUTH_PASS:-}"
 
 banner "WafControl Installer (Debian/Ubuntu)" "=" 72
-cat <<'TXT'
+if is_docker_build; then
+  cat <<'TXT'
+Image build: application (Django, Gunicorn, Celery) + web server + WAF.
+PostgreSQL and Redis are separate containers; services start with the container.
+TXT
+else
+  cat <<'TXT'
 This guided installer will set up:
   • WafControl application (Django, Gunicorn, Celery)
   • PostgreSQL database (reuse existing if found)
@@ -206,200 +207,204 @@ This guided installer will set up:
       - Nginx: ModSecurity v3 (built against your exact Nginx version) + latest CRS
       - Apache: libapache2-mod-security2 + latest CRS
 TXT
+fi
 line "-" 72
 
-echo
 section "Web server selection"
-auto_srv="$(detect_webserver_choice || true)"
-if [ -n "$auto_srv" ]; then
-  SERVER="$auto_srv"
-  say "Detected web server: $SERVER (auto-selected)."
-else
+if [[ -z "$SERVER" ]]; then
+  SERVER="$(detect_webserver_choice || true)"
+  [[ -n "$SERVER" ]] && say "Detected web server: $SERVER (auto-selected)."
+fi
+if [[ -z "$SERVER" ]]; then
   echo "Type 'nginx' to build ModSecurity v3 for your Nginx and apply latest CRS."
   echo "Type 'apache' to enable ModSecurity2 and apply latest CRS."
-  read -rp "Choose [nginx/apache] (default: nginx): " SERVER
-  SERVER="${SERVER:-nginx}"
-  [[ "$SERVER" =~ ^(nginx|apache)$ ]] || { err "Invalid server: $SERVER"; exit 1; }
+  ask SERVER "Choose [nginx/apache]" "nginx"
 fi
+[[ "$SERVER" =~ ^(nginx|apache)$ ]] || { err "Invalid server: $SERVER"; exit 1; }
 
-echo
-section "Run mode selection"
-echo "'ip' mode: best for local/direct IP testing (relaxed CSRF/SESSION secure flags)."
-echo "'domain' mode: use if you have a valid domain pointed to this host."
-read -rp "Choose [ip/domain] (default: ip): " MODE
-MODE="${MODE:-ip}"
-
-if [[ "$MODE" == "domain" && -z "${DOMAIN:-}" ]]; then
-  read -rp "Enter domain (e.g. waf.example.com): " DOMAIN
-  [[ -z "$DOMAIN" ]] && { err "Domain is required for domain mode."; exit 1; }
-fi
-
-SSL_ENABLE=0
-CERTBOT_EMAIL="${CERTBOT_EMAIL:-}"
-if [[ "$MODE" == "domain" ]]; then
-  say "In domain mode the service will bind to :80 and optionally :443."
-  read -rp "Enable SSL with Let's Encrypt? [y/N]: " SSL_CH
-  [[ "$SSL_CH" =~ ^[Yy]$ ]] && SSL_ENABLE=1
+if is_docker_build; then
+  # Domain names, TLS and the database belong to the container's runtime configuration.
+  MODE="ip"; HTTP_PORT="${HTTP_PORT:-7000}"; SSL_ENABLE=0
+  BASIC_AUTH_ENABLE=0; BASIC_AUTH_USER=""; BASIC_AUTH_PASS=""
 else
-  if [[ -z "$HTTP_PORT" ]]; then
+  section "Run mode selection"
+  echo "'ip' mode: best for local/direct IP testing (relaxed CSRF/SESSION secure flags)."
+  echo "'domain' mode: use if you have a valid domain pointed to this host."
+  ask MODE "Choose [ip/domain]" "ip"
+  [[ "$MODE" =~ ^(ip|domain)$ ]] || { err "Invalid mode: $MODE"; exit 1; }
+
+  if [[ "$MODE" == "domain" ]]; then
+    ask DOMAIN "Enter domain (e.g. waf.example.com)"
+    [[ -n "$DOMAIN" ]] || { err "Domain is required for domain mode."; exit 1; }
+    say "In domain mode the service will bind to :80 and optionally :443."
+    if [[ -z "$SSL_ENABLE" ]]; then
+      if ask_yn "Enable SSL with Let's Encrypt?" "N"; then SSL_ENABLE=1; else SSL_ENABLE=0; fi
+    fi
+  else
+    SSL_ENABLE=0
     echo
     echo "HTTP listen port for the dashboard (default: 7000)."
-    read -rp "Port [7000]: " HTTP_PORT
-    HTTP_PORT="${HTTP_PORT:-7000}"
+    ask HTTP_PORT "Port" "7000"
+    [[ "$HTTP_PORT" =~ ^[0-9]+$ ]] || { err "Invalid port: $HTTP_PORT"; exit 1; }
   fi
-fi
 
-echo
-section "PostgreSQL detection"
-if command -v psql >/dev/null 2>&1; then
-  INSTALLED_MAJOR="$(psql -V | awk '{print $3}' | cut -d. -f1)"
-  PG_VERSION="${INSTALLED_MAJOR}"
-  say "PostgreSQL detected: version ${PG_VERSION} (will be reused)."
+  section "PostgreSQL detection"
+  if command -v psql >/dev/null 2>&1; then
+    INSTALLED_MAJOR="$(psql -V | awk '{print $3}' | cut -d. -f1)"
+    PG_VERSION="${INSTALLED_MAJOR}"
+    say "PostgreSQL detected: version ${PG_VERSION} (will be reused)."
 
-  conf_path="$(find_postgresql_conf "$PG_VERSION")"
-  if [ -n "$conf_path" ]; then
-    det_port="$(extract_port_from_conf "$conf_path")"
-    if [[ -n "$det_port" && "$det_port" =~ ^[0-9]+$ ]]; then
-      DB_PORT="$det_port"
-      say "Detected PostgreSQL port from config: ${DB_PORT}"
+    conf_path="$(find_postgresql_conf "$PG_VERSION")"
+    if [ -n "$conf_path" ]; then
+      det_port="$(extract_port_from_conf "$conf_path")"
+      if [[ -n "$det_port" && "$det_port" =~ ^[0-9]+$ ]]; then
+        DB_PORT="$det_port"
+        say "Detected PostgreSQL port from config: ${DB_PORT}"
+      else
+        say "Could not detect custom port from config. Using default ${DB_PORT}."
+      fi
     else
-      say "Could not detect custom port from config. Using default ${DB_PORT}."
+      say "postgresql.conf not found for auto-port detection. Using default ${DB_PORT}."
     fi
   else
-    say "postgresql.conf not found for auto-port detection. Using default ${DB_PORT}."
+    echo "PostgreSQL not detected."
+    echo "Enter the major version to install, for example: 17, 18, or any version you want."
+    while :; do
+      ask PG_VERSION "PostgreSQL major version to install" "$DEFAULT_PG_VER"
+      [[ "$PG_VERSION" =~ ^[0-9]+$ ]] && break
+      [[ "$NONINTERACTIVE" == "1" ]] && { err "Invalid PG_VERSION: $PG_VERSION"; exit 1; }
+      warn "Invalid PG_VERSION. Enter a number like 14, 15, 16, 17, 18."
+      PG_VERSION=""
+    done
+    say "Selected PostgreSQL major version: ${PG_VERSION}"
   fi
-else
-  echo "PostgreSQL not detected."
-  echo "Enter the major version to install, for example: 17, 18, or any version you want."
+
+  section "Database configuration (fresh install)"
   while :; do
-    read -rp "PostgreSQL major version to install [${DEFAULT_PG_VER}]: " PG_VERSION
-    PG_VERSION="${PG_VERSION:-$DEFAULT_PG_VER}"
-    [[ "$PG_VERSION" =~ ^[0-9]+$ ]] && break
-    warn "Invalid PG_VERSION. Enter a number like 14, 15, 16, 17, 18."
+    ask DB_NAME "Database name" "wafcontrol"
+    dbname_is_valid "$DB_NAME" && break
+    [[ "$NONINTERACTIVE" == "1" ]] && { err "Invalid DB_NAME: $DB_NAME"; exit 1; }
+    warn "Invalid database name. Use letters/numbers/underscore and start with a letter or underscore."
+    DB_NAME=""
   done
-  say "Selected PostgreSQL major version: ${PG_VERSION}"
-fi
-
-echo
-section "Database configuration (fresh install)"
-while :; do
-  read -rp "Database name [${DB_NAME}]: " IN_DBNAME
-  IN_DBNAME="${IN_DBNAME:-$DB_NAME}"
-  dbname_is_valid "$IN_DBNAME" && { DB_NAME="$IN_DBNAME"; break; }
-  warn "Invalid database name. Use letters/numbers/underscore and start with a letter or underscore."
-done
-
-while :; do
-  read -rp "Database user [${DB_USER}]: " IN_DBUSER
-  IN_DBUSER="${IN_DBUSER:-$DB_USER}"
-  dbuser_is_valid "$IN_DBUSER" && { DB_USER="$IN_DBUSER"; break; }
-  warn "Invalid database user. Use letters/numbers/underscore and start with a letter or underscore."
-done
-
-read -srp "Database password [auto-generate if empty]: " IN_DBPASS; echo
-DB_PASS="${IN_DBPASS:-$DB_PASS}"
-
-echo
-section "Database availability check"
-if command -v psql >/dev/null 2>&1 && [[ "$DB_HOST" == "127.0.0.1" || "$DB_HOST" == "localhost" ]]; then
-  if command -v sudo >/dev/null 2>&1; then
-    pg_query() { sudo -u postgres psql -tAc "$1" 2>/dev/null || true; }
-  else
-    pg_query() { su -s /bin/bash postgres -c "psql -tAc \"$1\"" 2>/dev/null || true; }
-  fi
-
   while :; do
-    db_exists="$(pg_query "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}';" | tr -d '[:space:]')"
-    role_exists="$(pg_query "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}';" | tr -d '[:space:]')"
+    ask DB_USER "Database user" "wafcontrol_user"
+    dbuser_is_valid "$DB_USER" && break
+    [[ "$NONINTERACTIVE" == "1" ]] && { err "Invalid DB_USER: $DB_USER"; exit 1; }
+    warn "Invalid database user. Use letters/numbers/underscore and start with a letter or underscore."
+    DB_USER=""
+  done
+  ask_secret DB_PASS "Database password [auto-generate if empty]"
 
-    if [[ "$db_exists" == "1" || "$role_exists" == "1" ]]; then
-      warn "Conflicting objects detected:"
-      [[ "$db_exists" == "1" ]] && warn "  - Database exists: ${DB_NAME}"
-      [[ "$role_exists" == "1" ]] && warn "  - Role exists:     ${DB_USER}"
-      warn "Please enter NEW names to avoid conflicts."
-
-      while :; do
-        read -rp "New database name: " DB_NAME
-        [[ -n "$DB_NAME" ]] || { warn "Database name cannot be empty."; continue; }
-        dbname_is_valid "$DB_NAME" || { warn "Invalid database name format."; continue; }
-        db_exists="$(pg_query "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}';" | tr -d '[:space:]')"
-        [[ "$db_exists" == "1" ]] && { warn "Database exists: ${DB_NAME}"; continue; }
-        break
-      done
-
-      while :; do
-        read -rp "New database user: " DB_USER
-        [[ -n "$DB_USER" ]] || { warn "User cannot be empty."; continue; }
-        dbuser_is_valid "$DB_USER" || { warn "Invalid user format."; continue; }
-        role_exists="$(pg_query "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}';" | tr -d '[:space:]')"
-        [[ "$role_exists" == "1" ]] && { warn "Role exists: ${DB_USER}"; continue; }
-        break
-      done
-
-      DB_PASS=""
-      read -srp "Database password [auto-generate if empty]: " DB_PASS; echo
-      continue
+  section "Database availability check"
+  if command -v psql >/dev/null 2>&1 && [[ "$DB_HOST" == "127.0.0.1" || "$DB_HOST" == "localhost" ]]; then
+    if command -v sudo >/dev/null 2>&1; then
+      pg_query() { sudo -u postgres psql -tAc "$1" 2>/dev/null || true; }
+    else
+      pg_query() { su -s /bin/bash postgres -c "psql -tAc \"$1\"" 2>/dev/null || true; }
     fi
 
-    say "No conflicts detected for DB_NAME/DB_USER."
-    break
-  done
-else
-  warn "Skipping DB availability check (psql missing or DB_HOST not local)."
-fi
+    while :; do
+      db_exists="$(pg_query "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}';" | tr -d '[:space:]')"
+      role_exists="$(pg_query "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}';" | tr -d '[:space:]')"
 
-if [[ -z "${DB_PASS:-}" ]]; then
-  DB_PASS="$(gen_pass)"
-  say "Generated DB password for ${DB_USER}."
-fi
+      if [[ "$db_exists" == "1" || "$role_exists" == "1" ]]; then
+        warn "Conflicting objects detected:"
+        [[ "$db_exists" == "1" ]] && warn "  - Database exists: ${DB_NAME}"
+        [[ "$role_exists" == "1" ]] && warn "  - Role exists:     ${DB_USER}"
+        [[ "$NONINTERACTIVE" == "1" ]] && { err "Choose another DB_NAME/DB_USER."; exit 1; }
+        warn "Please enter NEW names to avoid conflicts."
 
-if [[ "$MODE" == "domain" && $SSL_ENABLE -eq 1 ]]; then
-  CERTBOT_EMAIL_DEFAULT="admin@${DOMAIN}"
-  read -rp "Email for Let's Encrypt notifications [${CERTBOT_EMAIL_DEFAULT}]: " CERTBOT_EMAIL
-  CERTBOT_EMAIL="${CERTBOT_EMAIL:-$CERTBOT_EMAIL_DEFAULT}"
-fi
+        while :; do
+          read -rp "New database name: " DB_NAME
+          [[ -n "$DB_NAME" ]] || { warn "Database name cannot be empty."; continue; }
+          dbname_is_valid "$DB_NAME" || { warn "Invalid database name format."; continue; }
+          db_exists="$(pg_query "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}';" | tr -d '[:space:]')"
+          [[ "$db_exists" == "1" ]] && { warn "Database exists: ${DB_NAME}"; continue; }
+          break
+        done
 
-echo
-section "Optional HTTP Basic Auth (extra layer before login)"
-read -rp "Enable HTTP Basic Auth for dashboard? [y/N]: " BASIC_CH
-if [[ "$BASIC_CH" =~ ^[Yy]$ ]]; then
-  BASIC_AUTH_ENABLE=1
-  while :; do
-    read -rp "Basic Auth username: " BASIC_AUTH_USER
-    [[ -n "$BASIC_AUTH_USER" && "$BASIC_AUTH_USER" != *:* ]] && break || warn "Username cannot be empty or contain ':'."
-  done
-  while :; do
-    read -srp "Basic Auth password: " BASIC_AUTH_PASS; echo
-    [[ -n "$BASIC_AUTH_PASS" ]] && break || warn "Password cannot be empty."
-  done
-  say "HTTP Basic Auth will be applied at web server level (separate from Django login)."
-else
-  BASIC_AUTH_ENABLE=0
-  BASIC_AUTH_USER=""
-  BASIC_AUTH_PASS=""
+        while :; do
+          read -rp "New database user: " DB_USER
+          [[ -n "$DB_USER" ]] || { warn "User cannot be empty."; continue; }
+          dbuser_is_valid "$DB_USER" || { warn "Invalid user format."; continue; }
+          role_exists="$(pg_query "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}';" | tr -d '[:space:]')"
+          [[ "$role_exists" == "1" ]] && { warn "Role exists: ${DB_USER}"; continue; }
+          break
+        done
+
+        DB_PASS=""
+        read -srp "Database password [auto-generate if empty]: " DB_PASS; echo
+        continue
+      fi
+
+      say "No conflicts detected for DB_NAME/DB_USER."
+      break
+    done
+  else
+    warn "Skipping DB availability check (psql missing or DB_HOST not local)."
+  fi
+
+  if [[ -z "${DB_PASS:-}" ]]; then
+    DB_PASS="$(gen_pass)"
+    say "Generated DB password for ${DB_USER}."
+  fi
+
+  if [[ "$MODE" == "domain" && "$SSL_ENABLE" == "1" ]]; then
+    ask CERTBOT_EMAIL "Email for Let's Encrypt notifications" "admin@${DOMAIN}"
+  fi
+
+  section "Optional HTTP Basic Auth (extra layer before login)"
+  if [[ -z "$BASIC_AUTH_ENABLE" ]]; then
+    if ask_yn "Enable HTTP Basic Auth for dashboard?" "N"; then BASIC_AUTH_ENABLE=1; else BASIC_AUTH_ENABLE=0; fi
+  fi
+  if [[ "$BASIC_AUTH_ENABLE" == "1" ]]; then
+    while :; do
+      ask BASIC_AUTH_USER "Basic Auth username"
+      [[ -n "$BASIC_AUTH_USER" && "$BASIC_AUTH_USER" != *:* ]] && break
+      [[ "$NONINTERACTIVE" == "1" ]] && { err "BASIC_AUTH_USER is empty or contains ':'."; exit 1; }
+      warn "Username cannot be empty or contain ':'."
+      BASIC_AUTH_USER=""
+    done
+    while :; do
+      ask_secret BASIC_AUTH_PASS "Basic Auth password"
+      [[ -n "$BASIC_AUTH_PASS" ]] && break
+      [[ "$NONINTERACTIVE" == "1" ]] && { err "BASIC_AUTH_PASS is required."; exit 1; }
+      warn "Password cannot be empty."
+    done
+    say "HTTP Basic Auth will be applied at web server level (separate from Django login)."
+  else
+    BASIC_AUTH_ENABLE=0; BASIC_AUTH_USER=""; BASIC_AUTH_PASS=""
+  fi
 fi
 
 echo
 banner "Summary" "=" 72
+echo "• Target:       $INSTALL_TARGET"
 echo "• Server:       $SERVER"
-if [[ "$MODE" == "domain" ]]; then
-  echo "• Mode:         domain (domain=$DOMAIN)"
-  echo "• HTTP/S:       80$( [[ $SSL_ENABLE -eq 1 ]] && echo ' and 443 (SSL enabled)' || echo ' only' )"
-else
-  echo "• Mode:         ip"
-  echo "• HTTP Port:    $HTTP_PORT"
-fi
-echo "• PostgreSQL:   $PG_VERSION  (db=$DB_NAME, user=$DB_USER, port=$DB_PORT)"
+echo "• Source:       ${APP_SRC:-$REPO_URL ($REPO_BRANCH)}"
 echo "• App Path:     $APP_DIR"
-echo "• Basic Auth:   $([[ $BASIC_AUTH_ENABLE -eq 1 ]] && echo "enabled (user=$BASIC_AUTH_USER)" || echo "disabled")"
-read -rp "Proceed with installation? [y/N]: " PROCEED
-[[ "$PROCEED" =~ ^[Yy]$ ]] || { warn "Aborted."; exit 0; }
+if is_docker_build; then
+  echo "• HTTP Port:    $HTTP_PORT (panel)"
+else
+  if [[ "$MODE" == "domain" ]]; then
+    echo "• Mode:         domain (domain=$DOMAIN)"
+    echo "• HTTP/S:       80$( [[ $SSL_ENABLE -eq 1 ]] && echo ' and 443 (SSL enabled)' || echo ' only' )"
+  else
+    echo "• Mode:         ip"
+    echo "• HTTP Port:    $HTTP_PORT"
+  fi
+  echo "• PostgreSQL:   $PG_VERSION  (db=$DB_NAME, user=$DB_USER, port=$DB_PORT)"
+  echo "• Basic Auth:   $([[ $BASIC_AUTH_ENABLE -eq 1 ]] && echo "enabled (user=$BASIC_AUTH_USER)" || echo "disabled")"
+fi
+ask_yn "Proceed with installation?" "Y" || { warn "Aborted."; exit 0; }
 
 if [ "$(detect_os)" = "debian" ]; then
   ensure_debian_sources
 fi
 
-state_bootstrap
+state_init
+state_put_flag "target" "$INSTALL_TARGET"
 state_put_flag "server" "$SERVER"
 state_put_flag "mode" "$MODE"
 state_put_flag "domain" "${DOMAIN:-}"
@@ -427,18 +432,28 @@ else
   apt-get install -y --no-install-recommends python3 python3-venv python3-dev python3-pip || true
 fi
 
-apt-get install -y --no-install-recommends \
-  curl "$GPG_PKG" ca-certificates lsb-release debian-archive-keyring \
-  build-essential git pkg-config jq wget tar sed grep procps \
-  libpq-dev redis-server openssl
-
-banner "Fetching project and preparing Python environment" "=" 72
-mkdir -p "$APP_DIR"
-if [[ -d "$APP_DIR/.git" || -f "$APP_DIR/manage.py" ]]; then
-  warn "Project already present at ${APP_DIR}. Skipping clone."
+BASE_PKGS=(curl "$GPG_PKG" ca-certificates lsb-release debian-archive-keyring
+  build-essential git pkg-config jq wget tar sed grep procps libpq-dev openssl)
+if is_docker_build; then
+  BASE_PKGS+=(supervisor postgresql-client lsof net-tools iproute2)
 else
-  say "Cloning WafControl into ${APP_DIR}..."
-  git clone "https://github.com/wafcontrol/wafcontrol.git" "$APP_DIR"
+  BASE_PKGS+=(redis-server)
+fi
+apt-get install -y --no-install-recommends "${BASE_PKGS[@]}"
+
+banner "Preparing project and Python environment" "=" 72
+if [[ -f "$APP_DIR/manage.py" ]]; then
+  warn "Project already present at ${APP_DIR}. Keeping it."
+elif [[ -n "$APP_SRC" ]]; then
+  [[ -f "$APP_SRC/manage.py" ]] || { err "APP_SRC is not a WafControl checkout: $APP_SRC"; exit 1; }
+  say "Copying WafControl from ${APP_SRC} into ${APP_DIR}..."
+  mkdir -p "$APP_DIR"
+  cp -a "$APP_SRC/." "$APP_DIR/"
+  rm -rf "$APP_DIR/venv" "$APP_DIR/.env"
+  state_append_array CREATED_FILES "$APP_DIR"
+else
+  say "Cloning ${REPO_URL} (${REPO_BRANCH}) into ${APP_DIR}..."
+  git clone --branch "$REPO_BRANCH" "$REPO_URL" "$APP_DIR"
   state_append_array CREATED_FILES "$APP_DIR"
 fi
 
@@ -464,23 +479,29 @@ pip install django-environ "psycopg[binary]>=3.1" || pip install psycopg2-binary
 export APP_USER APP_DIR VENV_DIR RUNTIME_DIR
 export SERVER MODE DOMAIN HTTP_PORT
 export DB_NAME DB_USER DB_PASS DB_HOST DB_PORT PG_VERSION
-export STATE_DIR STATE_FILE MODULE_BASE SSL_ENABLE CERTBOT_EMAIL
+export STATE_DIR STATE_FILE INSTALL_TARGET NONINTERACTIVE
 
-fetch_and_run "postgres.sh"
-
-banner "Writing .env and preparing" "=" 72
-SECRET_KEY_VALUE="$(gen_pass)"
-CSRF_SEC=True; SESSION_SEC=True
-[[ "$MODE" == "ip" ]] && CSRF_SEC=False && SESSION_SEC=False
-ALLOWED_LIST="127.0.0.1,localhost"
-if [[ "$MODE" == "domain" ]]; then
-  ALLOWED_LIST="${ALLOWED_LIST},${DOMAIN},www.${DOMAIN}"
+if is_docker_build; then
+  banner "Collecting static files" "=" 72
+  # Settings need these at import time; the real values come from the container environment.
+  SECRET_KEY=build DB_NAME=build DB_USER=build DB_PASS=build \
+    "${VENV_DIR}/bin/python" "${APP_DIR}/manage.py" collectstatic --noinput
 else
-  IP=$(hostname -I | awk '{print $1}')
-  [[ -n "$IP" ]] && ALLOWED_LIST="${ALLOWED_LIST},${IP}"
-fi
+  run_module "postgres.sh"
 
-cat > "${APP_DIR}/.env" <<EOF
+  banner "Writing .env and preparing" "=" 72
+  SECRET_KEY_VALUE="$(gen_pass)"
+  CSRF_SEC=True; SESSION_SEC=True
+  [[ "$MODE" == "ip" ]] && CSRF_SEC=False && SESSION_SEC=False
+  ALLOWED_LIST="127.0.0.1,localhost"
+  if [[ "$MODE" == "domain" ]]; then
+    ALLOWED_LIST="${ALLOWED_LIST},${DOMAIN},www.${DOMAIN}"
+  else
+    IP=$(hostname -I | awk '{print $1}')
+    [[ -n "$IP" ]] && ALLOWED_LIST="${ALLOWED_LIST},${IP}"
+  fi
+
+  cat > "${APP_DIR}/.env" <<EOF
 SECRET_KEY=${SECRET_KEY_VALUE}
 DEBUG=False
 ALLOWED_HOSTS=${ALLOWED_LIST}
@@ -498,144 +519,45 @@ SECURE_BROWSER_XSS_FILTER=True
 SECURE_CONTENT_TYPE_NOSNIFF=True
 X_FRAME_OPTIONS=DENY
 EOF
-state_append_array CREATED_FILES "${APP_DIR}/.env"
+  chmod 600 "${APP_DIR}/.env"
+  state_append_array CREATED_FILES "${APP_DIR}/.env"
 
-if [[ "$MODE" == "domain" && -n "${DOMAIN:-}" ]]; then
-  {
-    echo "CSRF_TRUSTED_ORIGINS=https://${DOMAIN},https://www.${DOMAIN}"
-    echo "SECURE_PROXY_SSL_HEADER=HTTP_X_FORWARDED_PROTO,https"
-    echo "USE_X_FORWARDED_HOST=True"
-  } >> "${APP_DIR}/.env"
+  if [[ "$MODE" == "domain" && -n "${DOMAIN:-}" ]]; then
+    {
+      echo "CSRF_TRUSTED_ORIGINS=https://${DOMAIN},https://www.${DOMAIN}"
+      echo "SECURE_PROXY_SSL_HEADER=HTTP_X_FORWARDED_PROTO,https"
+      echo "USE_X_FORWARDED_HOST=True"
+    } >> "${APP_DIR}/.env"
+  fi
+
+  banner "Verifying database connectivity" "=" 72
+  if ! PGPASSWORD="${DB_PASS}" psql -h "${DB_HOST}" -p "${DB_PORT}" -U "${DB_USER}" -d "${DB_NAME}" -c 'select 1;' >/dev/null 2>&1; then
+    err "Database auth failed. Check DB_USER/DB_PASS/DB_PORT/pg_hba.conf."
+    exit 1
+  fi
+
+  banner "Applying migrations and collecting static files" "=" 72
+  "${VENV_DIR}/bin/python" "${APP_DIR}/manage.py" makemigrations wafinstaller || true
+  "${VENV_DIR}/bin/python" "${APP_DIR}/manage.py" migrate --noinput
+  mkdir -p "${APP_DIR}/frontend"
+  "${VENV_DIR}/bin/python" "${APP_DIR}/manage.py" collectstatic --noinput
 fi
-
-banner "Verifying database connectivity" "=" 72
-if ! PGPASSWORD="${DB_PASS}" psql -h "${DB_HOST}" -p "${DB_PORT}" -U "${DB_USER}" -d "${DB_NAME}" -c 'select 1;' >/dev/null 2>&1; then
-  err "Database auth failed. Check DB_USER/DB_PASS/DB_PORT/pg_hba.conf."
-  exit 1
-fi
-
-banner "Applying migrations and collecting static files" "=" 72
-"${VENV_DIR}/bin/python" "${APP_DIR}/manage.py" makemigrations wafinstaller || true
-"${VENV_DIR}/bin/python" "${APP_DIR}/manage.py" migrate --noinput
-mkdir -p "${APP_DIR}/frontend"
-"${VENV_DIR}/bin/python" "${APP_DIR}/manage.py" collectstatic --noinput
-
-NGX_GROUP_FALLBACK="www-data"
-NGX_GROUP_VAL="$NGX_GROUP_FALLBACK"
-if [[ "$SERVER" == "nginx" ]]; then
-  NGX_MAIN="/etc/nginx/nginx.conf"
-  detect_from_file() {
-    local file="$1"
-    [ -r "$file" ] || return 1
-    grep -E '^[[:space:]]*user[[:space:]]+' "$file" \
-      | sed -E 's/#.*$//' \
-      | head -n1 \
-      | sed -E 's/^[[:space:]]*user[[:space:]]+([^;[:space:]]+).*/\1/' \
-      | tr -d '\n'
-  }
-  detect_nginx_user() {
-    local u=""
-    if [ -r "$NGX_MAIN" ]; then
-      u="$(detect_from_file "$NGX_MAIN" || true)"
-    fi
-    if [ -z "$u" ] && command -v nginx >/dev/null 2>&1; then
-      if timeout 3s nginx -T >/dev/null 2>&1; then
-        u="$(nginx -T 2>/dev/null | grep -E '^[[:space:]]*user[[:space:]]+' | sed -E 's/#.*$//' | head -n1 | sed -E 's/^[[:space:]]*user[[:space:]]+([^;[:space:]]+).*/\1/' | tr -d '\n')" || true
-      fi
-    fi
-    if [ -z "$u" ]; then
-      u="$(ps -o user= -C nginx 2>/dev/null | head -n1 || true)"
-    fi
-    [ -n "$u" ] || u="nginx"
-    echo "$u"
-  }
-  NGX_USER_DET="$(detect_nginx_user)"
-  NGX_GROUP_VAL="$(id -gn "$NGX_USER_DET" 2>/dev/null || echo "$NGX_USER_DET")"
-  say "Using web group for units: ${NGX_GROUP_VAL}"
-fi
-
-banner "Creating and enabling systemd units" "=" 72
-GUNI_UNIT="/etc/systemd/system/wafcontrol.service"
-CELERYW_UNIT="/etc/systemd/system/wafcontrol-celery-worker.service"
-CELERYB_UNIT="/etc/systemd/system/wafcontrol-celery-beat.service"
-
-WEB_GROUP_LINE="Group=www-data"
-if [[ "$SERVER" == "nginx" ]]; then
-  WEB_GROUP_LINE="Group=${NGX_GROUP_VAL}"
-fi
-
-cat > "$GUNI_UNIT" <<EOF
-[Unit]
-Description=WafControl Gunicorn
-After=network-online.target postgresql.service
-Wants=network-online.target
-[Service]
-User=root
-${WEB_GROUP_LINE}
-WorkingDirectory=${APP_DIR}
-Environment="DJANGO_SETTINGS_MODULE=WafControl.settings"
-RuntimeDirectory=wafcontrol
-RuntimeDirectoryMode=0755
-UMask=0007
-ExecStart=${VENV_DIR}/bin/gunicorn --workers 4 --timeout 120 --bind unix:${RUNTIME_DIR}/gunicorn.sock WafControl.wsgi:application
-Restart=always
-RestartSec=3
-PrivateTmp=true
-[Install]
-WantedBy=multi-user.target
-EOF
-
-cat > "$CELERYW_UNIT" <<EOF
-[Unit]
-Description=WafControl Celery Worker
-After=network-online.target redis-server.service
-Wants=network-online.target
-[Service]
-User=root
-${WEB_GROUP_LINE}
-WorkingDirectory=${APP_DIR}
-Environment="DJANGO_SETTINGS_MODULE=WafControl.settings"
-ExecStart=${VENV_DIR}/bin/celery -A WafControl worker -l INFO
-Restart=always
-RestartSec=3
-[Install]
-WantedBy=multi-user.target
-EOF
-
-cat > "$CELERYB_UNIT" <<EOF
-[Unit]
-Description=WafControl Celery Beat
-After=network-online.target redis-server.service
-Wants=network-online.target
-[Service]
-User=root
-${WEB_GROUP_LINE}
-WorkingDirectory=${APP_DIR}
-Environment="DJANGO_SETTINGS_MODULE=WafControl.settings"
-ExecStart=${VENV_DIR}/bin/celery -A WafControl beat -l INFO
-Restart=always
-RestartSec=3
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now wafcontrol.service wafcontrol-celery-worker.service wafcontrol-celery-beat.service
-state_append_array CREATED_UNITS "$GUNI_UNIT"
-state_append_array CREATED_UNITS "$CELERYW_UNIT"
-state_append_array CREATED_UNITS "$CELERYB_UNIT"
 
 if [[ "$SERVER" == "nginx" ]]; then
-  fetch_and_run "waf-nginx.sh"
+  run_module "waf-nginx.sh"
 else
-  fetch_and_run "waf-apache.sh"
+  run_module "waf-apache.sh"
+fi
+run_module "services.sh"
+
+if is_docker_build; then
+  banner "Image build complete" "=" 72
+  exit 0
 fi
 
 echo
 banner "Create Wafcontrol Admin" "=" 72
-read -rp "Create now? [y/N]: " MKADMIN
-if [[ "$MKADMIN" =~ ^[Yy]$ ]]; then
-  source "${VENV_DIR}/bin/activate"
+if ask_yn "Create now?" "N"; then
   "${VENV_DIR}/bin/python" "${APP_DIR}/manage.py" createsuperuser || warn "createsuperuser skipped."
 fi
 

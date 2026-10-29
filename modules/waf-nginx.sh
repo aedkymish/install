@@ -1,28 +1,17 @@
 #!/usr/bin/env bash
+# install/modules/waf-nginx.sh - Nginx + ModSecurity v3 (dynamic module built for the
+# installed Nginx) + latest CRS + the WafControl panel vhost.
+#
+# Inputs (environment): APP_DIR VENV_DIR RUNTIME_DIR MODE [HTTP_PORT DOMAIN SSL_ENABLE
+# CERTBOT_EMAIL BASIC_AUTH_*]. With INSTALL_TARGET=docker nothing is started or reloaded.
 set -euo pipefail
-
-is_tty=0; [ -t 1 ] && is_tty=1
-if [ "$is_tty" -eq 1 ]; then
-  GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; BLUE='\033[1;34m'; NC='\033[0m'
-else
-  GREEN=''; YELLOW=''; RED=''; BLUE=''; NC=''
-fi
-say()  { printf "%b[+]%b %s\n" "$GREEN" "$NC" "$*"; }
-warn() { printf "%b[!]%b %s\n" "$YELLOW" "$NC" "$*"; }
-err()  { printf "%b[x]%b %s\n" "$RED" "$NC" "$*" >&2; }
-line() { local ch="${1:-=}"; local w="${2:-72}"; printf '%*s\n' "$w" '' | tr ' ' "$ch"; }
-banner(){ local title="$1"; local ch="${2:-=}"; local w="${3:-72}"; line "$ch" "$w"; printf "%b%s%b\n" "$BLUE" "$title" "$NC"; line "$ch" "$w"; }
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 
 trap 'err "Failed on line $LINENO"' ERR
-[[ $EUID -eq 0 ]] || { err "Run as root (sudo)."; exit 1; }
+require_root
 export DEBIAN_FRONTEND=noninteractive
-
-STATE_DIR="${STATE_DIR:-/var/lib/wafcontrol-installer}"
-STATE_FILE="${STATE_FILE:-$STATE_DIR/state.env}"
 mkdir -p "$STATE_DIR"; touch "$STATE_FILE"
-state_append_array() { printf '%s+=(%q)\n' "$1" "$2" >> "$STATE_FILE"; }
-state_put_map()      { printf '%s[%q]=%q\n' "$1" "$2" "$3" >> "$STATE_FILE"; }
-source "$STATE_FILE" 2>/dev/null || true
+state_load
 
 APP_DIR="${APP_DIR:?}"
 VENV_DIR="${VENV_DIR:?}"
@@ -42,12 +31,13 @@ banner "Nginx + ModSecurity v3 + CRS" "=" 72
 
 if ! command -v nginx >/dev/null 2>&1; then
   say "Installing Nginx from nginx.org..."
+  apt install -y curl gnupg ca-certificates
   curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor | tee /usr/share/keyrings/nginx-archive-keyring.gpg >/dev/null
   . /etc/os-release
   echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/${ID} ${VERSION_CODENAME} nginx" > /etc/apt/sources.list.d/nginx.list
   apt update -y
   apt install -y nginx
-  systemctl enable --now nginx
+  svc_enable_now nginx
 else
   say "Nginx detected."
 fi
@@ -101,8 +91,8 @@ if ! pkg-config --exists modsecurity; then
   fi
 
   if { [ "${ID:-}" = "ubuntu" ] && [ "${VERSION_CODENAME:-}" = "resolute" ]; }; then
-  	XML2_PKGS="libxml2-dev"
-   	PCRE_PKGS="libpcre2-dev"
+    XML2_PKGS="libxml2-dev"
+    PCRE_PKGS="libpcre2-dev"
   fi
   apt install -y make gcc autoconf automake libtool gettext pkg-config \
     libcurl4-openssl-dev liblua5.3-dev $PCRE_PKGS \
@@ -165,7 +155,7 @@ if [[ ! -d "nginx-${NVER}" ]]; then
   tar -xzf "nginx-${NVER}.tar.gz"
 fi
 
-apt-get build-dep -y nginx || true
+apt-get build-dep -y nginx 2>/dev/null || true
 cd "nginx-${NVER}"
 ./configure --with-compat --add-dynamic-module=/usr/local/src/ModSecurity-nginx
 make modules
@@ -235,6 +225,20 @@ sed -i -E "s|^([[:blank:]]*SecUnicodeMapFile[[:blank:]]+)unicode.mapping([[:blan
 
 sed -i -E 's/^\s*SecRuleEngine\s+DetectionOnly/SecRuleEngine On/i' "$MDIR/modsecurity.conf" || true
 grep -qE '^\s*SecRuleEngine\s+' "$MDIR/modsecurity.conf" || echo "SecRuleEngine On" >> "$MDIR/modsecurity.conf"
+
+# The audit log is written by nginx *worker* processes (not root). If they cannot create it,
+# ModSecurity silently logs nothing and WafControl only sees error.log (no request details).
+ensure_audit_log_writable() {
+  local audit
+  audit="$(awk '/^[[:space:]]*SecAuditLog[[:space:]]+/ {gsub(/"/, "", $2); print $2; exit}' "$MDIR/modsecurity.conf" 2>/dev/null)"
+  [[ -n "$audit" ]] || return 0
+  mkdir -p "$(dirname "$audit")"
+  touch "$audit"
+  chown "$NGX_USER":adm "$audit" 2>/dev/null || chown "$NGX_USER" "$audit" 2>/dev/null || true
+  chmod 640 "$audit"
+  say "Audit log $audit is writable by nginx workers ($NGX_USER)."
+}
+ensure_audit_log_writable
 
 MAIN="$MDIR/main.conf"
 if [[ ! -f "$MAIN" ]]; then
@@ -338,13 +342,9 @@ fi
 for f in REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf RESPONSE-999-EXCLUSION-RULES-AFTER-CRS.conf; do
   [[ -f "$CRS_DIR/rules/$f" ]] || { [[ -f "$CRS_DIR/rules/${f}.example" ]] && cp "$CRS_DIR/rules/$f.example" "$CRS_DIR/rules/${f}" || true; }
 done
-EXCL="$CRS_DIR/rules/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf"
-if ! grep -q '/crs/rules/save/' "$EXCL" 2>/dev/null; then
-  cat >> "$EXCL" <<'EOR'
-SecRule REQUEST_URI "@beginsWith /crs/rules/save/"        "id:1500010,phase:1,nolog,pass,ctl:ruleEngine=Off"
-SecRule REQUEST_URI "@beginsWith /dashboard/crs/settings/" "id:1500011,phase:1,nolog,pass,ctl:ruleEngine=Off"
-EOR
-fi
+# Dashboard exclusions are scoped to the panel vhost (scripts/panel_waf_exclusions.sh), never global:
+# a global REQUEST_URI exclusion turned the WAF off for those paths on every protected site.
+sed -i -E '/id:15000(10|11)\b/d; /^# (WAF dashboard exclusions|Exclude WAF dashboard endpoints)$/d' "$CRS_DIR/rules/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf" 2>/dev/null || true
 sed -i '/Include .*crs-setup.conf/d' "$MAIN" || true
 sed -i '/Include .*rules\/\*.conf/d' "$MAIN" || true
 {
@@ -366,45 +366,14 @@ if [[ "${BASIC_AUTH_ENABLE}" = "1" && -n "${BASIC_AUTH_USER}" && -n "${BASIC_AUT
 fi
 
 if [[ "$MODE" == "domain" ]]; then
-  cat > "$VHOST" <<NGX
-server {
-    listen 80;
-    server_name ${DOMAIN} www.${DOMAIN};
-
-    access_log /var/log/nginx/wafcontrol_access.log;
-    error_log  /var/log/nginx/wafcontrol_error.log;
-
-    location /static/ {
-        alias ${STATIC_DIR}/static/;
-        autoindex off;
-    }
-
-    location / {
-${AUTH_SNIPPET}
-        proxy_set_header Host \$http_host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_read_timeout 120s;
-        proxy_connect_timeout 120s;
-        proxy_pass http://unix:${RUNTIME_DIR}/gunicorn.sock;
-    }
-}
-NGX
-  state_append_array CREATED_FILES "$VHOST"
-  say "App vhost written: $VHOST (port 80)"
-
-  if [[ "$SSL_ENABLE" -eq 1 ]]; then
-    say "Installing certbot and enabling SSL for ${DOMAIN}"
-    apt install -y certbot python3-certbot-nginx
-    EMAIL="${CERTBOT_EMAIL:-admin@${DOMAIN}}"
-    certbot --nginx -d "$DOMAIN" -d "www.$DOMAIN" --non-interactive --agree-tos -m "$EMAIL" --redirect || warn "Certbot failed"
-  fi
+  LISTEN="80"; SERVER_NAMES="${DOMAIN} www.${DOMAIN}"
 else
-  cat > "$VHOST" <<NGX
+  LISTEN="${HTTP_PORT}"; SERVER_NAMES="_"
+fi
+cat > "$VHOST" <<NGX
 server {
-    listen ${HTTP_PORT};
-    server_name _;
+    listen ${LISTEN};
+    server_name ${SERVER_NAMES};
 
     access_log /var/log/nginx/wafcontrol_access.log;
     error_log  /var/log/nginx/wafcontrol_error.log;
@@ -426,14 +395,28 @@ ${AUTH_SNIPPET}
     }
 }
 NGX
-  state_append_array CREATED_FILES "$VHOST"
-  say "App vhost written: $VHOST (port ${HTTP_PORT})"
+state_append_array CREATED_FILES "$VHOST"
+say "App vhost written: $VHOST (port ${LISTEN})"
+
+# Panel-only WAF exclusions: saving config text in the panel would otherwise be blocked by CRS.
+PANEL_EXCL="${APP_DIR}/scripts/panel_waf_exclusions.sh"
+if [[ -f "$PANEL_EXCL" ]]; then
+  WAFC_NO_RELOAD=1 bash "$PANEL_EXCL" || warn "Could not apply panel WAF exclusions; run $PANEL_EXCL."
+else
+  warn "This WafControl version has no scripts/panel_waf_exclusions.sh: saving config in the panel may be blocked (403)."
 fi
 
 if nginx -t; then
-  systemctl restart nginx
+  svc_restart nginx
   say "Nginx WAF ready (ModSecurity v3 + CRS)."
 else
   err "nginx -t failed. Check the configuration."
   exit 1
+fi
+
+if [[ "$MODE" == "domain" && "$SSL_ENABLE" -eq 1 ]] && ! is_docker_build; then
+  say "Installing certbot and enabling SSL for ${DOMAIN}"
+  apt install -y certbot python3-certbot-nginx
+  EMAIL="${CERTBOT_EMAIL:-admin@${DOMAIN}}"
+  certbot --nginx -d "$DOMAIN" -d "www.$DOMAIN" --non-interactive --agree-tos -m "$EMAIL" --redirect || warn "Certbot failed"
 fi
