@@ -35,7 +35,7 @@ done
 
 APP_DIR="${APP_DIR:-/opt/WafControl}"
 APP_SRC="${APP_SRC:-}"
-REPO_URL="${REPO_URL:-https://github.com/aedkymish/wafcontrol.git}"
+REPO_URL="${REPO_URL:-https://github.com/wafcontrol/wafcontrol.git}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
 INSTALLER_URL="${INSTALLER_URL:-https://github.com/aedkymish/install.git}"
 INSTALLER_BRANCH="${INSTALLER_BRANCH:-main}"
@@ -64,7 +64,6 @@ run_module() {
 
 detect_os() { . /etc/os-release 2>/dev/null || true; echo "${ID:-}"; }
 detect_codename() { . /etc/os-release 2>/dev/null || true; echo "${VERSION_CODENAME:-}"; }
-detect_ubuntu() { [ "$(detect_os)" = "ubuntu" ]; }
 
 ensure_debian_sources() {
   local codename; codename="$(detect_codename)"
@@ -93,32 +92,6 @@ deb http://deb.debian.org/debian trixie-updates main contrib non-free non-free-f
 deb http://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware
 EOF
       say "Created /etc/apt/sources.list for Debian 13 (trixie)."
-      ;;
-    *) : ;;
-  esac
-}
-
-ensure_python_ubuntu() {
-  . /etc/os-release
-  apt-get update -y
-  apt-get install -y --no-install-recommends python3 python3-venv python3-dev python3-pip || true
-  local ver
-  ver="$(python3 -c 'import sys;print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo 0)"
-  case "${VERSION_CODENAME:-}" in
-    jammy|lunar|mantic|noble) : ;;
-    focal)
-      case "$ver" in
-        3.10|3.11|3.12) : ;;
-        *)
-          apt-get install -y --no-install-recommends software-properties-common
-          add-apt-repository -y ppa:deadsnakes/ppa
-          apt-get update -y
-          apt-get install -y --no-install-recommends python3.10 python3.10-venv python3.10-dev || \
-          apt-get install -y --no-install-recommends python3.11 python3.11-venv python3.11-dev
-          update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 2 || true
-          update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 || true
-          ;;
-      esac
       ;;
     *) : ;;
   esac
@@ -426,11 +399,7 @@ apt-get update -y
 
 if apt-cache show gnupg2 >/dev/null 2>&1; then GPG_PKG=gnupg2; else GPG_PKG=gnupg; fi
 
-if detect_ubuntu; then
-  ensure_python_ubuntu
-else
-  apt-get install -y --no-install-recommends python3 python3-venv python3-dev python3-pip || true
-fi
+ensure_python
 
 BASE_PKGS=(curl "$GPG_PKG" ca-certificates lsb-release debian-archive-keyring
   build-essential git pkg-config jq wget tar sed grep procps libpq-dev openssl)
@@ -457,9 +426,13 @@ else
   state_append_array CREATED_FILES "$APP_DIR"
 fi
 
+if [[ -d "$VENV_DIR" ]] && ! _py_ok "$VENV_DIR/bin/python"; then
+  warn "Existing virtualenv uses Python older than ${PYTHON_MIN}; recreating it."
+  rm -rf "$VENV_DIR"
+fi
 if [[ ! -d "$VENV_DIR" ]]; then
   say "Creating virtualenv..."
-  python3 -m venv "$VENV_DIR"
+  "$PYTHON_BIN" -m venv "$VENV_DIR"
   state_append_array CREATED_FILES "$VENV_DIR"
 fi
 

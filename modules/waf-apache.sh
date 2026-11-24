@@ -47,7 +47,7 @@ APACHE_LOG_DIR="${APACHE_LOG_DIR:-/var/log/apache2}"
 
 banner "Installing ModSecurity2 and preparing CRS"
 apt update -y
-apt install -y libapache2-mod-security2 libmodsecurity3 curl jq wget tar gzip || true
+apt install -y libapache2-mod-security2 curl jq wget tar gzip || true
 a2enmod security2 >/dev/null 2>&1 || true
 install -d -m 0750 /var/cache/modsecurity || true
 

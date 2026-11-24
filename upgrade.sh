@@ -6,15 +6,17 @@
 #   sudo ./upgrade.sh --ref v1.1.0       a tag, branch or commit
 #
 # Steps: backup (code, .env, database, web server/ModSecurity config) -> new code -> Python
-# requirements -> migrations -> static files -> panel-only WAF exclusions (removes the global
-# exclusions of 1.0.0, which disabled the WAF on those paths for every site) -> restart -> checks.
-# A failure before the database migration puts the previous code back automatically.
+# requirements (in a Python 3.11+ virtualenv) -> migrations -> static files -> panel-only WAF
+# exclusions (removes the global exclusions of 1.0.0, which disabled the WAF on those paths for
+# every site) -> libmodsecurity >= 3.0.17 on nginx (older releases have known CVEs) -> restart
+# -> checks. A failure before the database migration puts the previous code (and virtualenv)
+# back automatically.
 #
 # Docker: rebuild the image instead (docker compose up -d --build); migrations run at start.
 set -euo pipefail
 
 APP_DIR="${APP_DIR:-/opt/WafControl}"
-REPO_URL="${REPO_URL:-https://github.com/aedkymish/wafcontrol.git}"
+REPO_URL="${REPO_URL:-https://github.com/wafcontrol/wafcontrol.git}"
 REPO_REF="${REPO_REF:-main}"
 TARGET_VERSION="1.1.0"
 BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/wafcontrol}"
@@ -110,6 +112,15 @@ case "$SERVER" in
 esac
 [[ -f "$BACKUP_DIR/webserver.tar.gz" ]] && say "Web server + ModSecurity config: webserver.tar.gz"
 
+# The pinned dependencies (Pillow 13 and others with CVE fixes) need Python 3.11+. Checked before
+# anything changes: if no suitable Python can be installed, the upgrade stops here.
+NEW_VENV=0
+if ! _py_ok "$VENV_DIR/bin/python"; then
+  warn "The virtualenv uses $("$VENV_DIR/bin/python" -V 2>&1); it will be recreated with Python ${PYTHON_MIN}+."
+  ensure_python
+  NEW_VENV=1
+fi
+
 # ---------- 2. Code ----------
 banner "Updating code" "-" 72
 cd "$APP_DIR"
@@ -123,7 +134,11 @@ rollback_code() {
   warn "Restoring the previous code ($OLD_COMMIT)..."
   git -C "$APP_DIR" remote remove wafcontrol-upgrade 2>/dev/null || true
   git -C "$APP_DIR" checkout -q -f "$OLD_COMMIT" || true
-  "$VENV_DIR/bin/pip" install -q -r "$APP_DIR/requirements.txt" || true
+  if [[ -n "${OLD_VENV:-}" && -d "$OLD_VENV" ]]; then
+    rm -rf "$VENV_DIR"; mv "$OLD_VENV" "$VENV_DIR"
+  else
+    "$VENV_DIR/bin/pip" install -q -r "$APP_DIR/requirements.txt" || true
+  fi
   svc_restart_all || true
 }
 svc_restart_all() {
@@ -145,7 +160,14 @@ say "Code: $(git rev-parse --short HEAD) ($REPO_REF), version $(installed_versio
 [[ "$(installed_version)" == "$TARGET_VERSION" ]] || warn "Fetched code reports version $(installed_version)."
 
 banner "Python requirements" "-" 72
-"$VENV_DIR/bin/pip" install -q --upgrade pip
+OLD_VENV=""
+if [[ $NEW_VENV -eq 1 ]]; then
+  OLD_VENV="${VENV_DIR}.old-${TS}"
+  mv "$VENV_DIR" "$OLD_VENV"
+  "$PYTHON_BIN" -m venv "$VENV_DIR"
+  say "Previous virtualenv kept at $OLD_VENV until the upgrade succeeds."
+fi
+"$VENV_DIR/bin/pip" install -q --upgrade pip setuptools wheel
 "$VENV_DIR/bin/pip" install -q -r requirements.txt
 "$PY" manage.py check
 
@@ -157,6 +179,8 @@ trap 'err "Failed on line $LINENO"; err "Upgrade failed after the migration step
 "$PY" manage.py migrate --noinput
 "$PY" manage.py collectstatic --noinput >/dev/null
 say "Migrations applied, static files collected."
+
+[[ -n "$OLD_VENV" ]] && rm -rf "$OLD_VENV"
 
 # ---------- 4. Web server / WAF ----------
 banner "WAF configuration" "-" 72
@@ -176,11 +200,44 @@ else
   fi
 fi
 
+# ---------- 4b. WAF engine CVEs ----------
+if [[ "$SERVER" == "nginx" ]]; then
+  modsec_pkgconfig_env
+  CUR="$(pkg-config --modversion modsecurity 2>/dev/null || echo unknown)"
+  if modsec_version_ok; then
+    ok "libmodsecurity ${CUR} (>= ${MODSEC_MIN_VERSION})"
+  else
+    banner "libmodsecurity ${CUR} has known CVEs: installing ${MODSEC_MIN_VERSION}" "-" 72
+    SO="$(nginx_modules_dir)/ngx_http_modsecurity_module.so"
+    LDCONF=/etc/ld.so.conf.d/00-modsecurity.conf
+    [[ -f "$SO" ]] && cp -a "$SO" "$BACKUP_DIR/ngx_http_modsecurity_module.so"
+    HAD_LDCONF=0; [[ -f "$LDCONF" ]] && HAD_LDCONF=1
+    if bash "$SELF_DIR/modules/modsecurity-nginx.sh" && nginx -t; then
+      # A reload keeps the already loaded module: the new engine needs a restart.
+      svc_restart nginx
+      ok "nginx now runs libmodsecurity $(modsec_pkgconfig_env; pkg-config --modversion modsecurity)."
+    else
+      err "Rebuilding ModSecurity failed; restoring the previous nginx module."
+      [[ -f "$BACKUP_DIR/ngx_http_modsecurity_module.so" ]] && cp -a "$BACKUP_DIR/ngx_http_modsecurity_module.so" "$SO"
+      [[ $HAD_LDCONF -eq 0 ]] && rm -f "$LDCONF" && ldconfig
+      nginx -t && svc_restart nginx || true
+      FAILED_ENGINE=1
+    fi
+  fi
+elif [[ "$SERVER" == "apache" ]]; then
+  # mod_security2 comes from the distribution, which backports security fixes into its packages.
+  apt-get update -y >/dev/null 2>&1 || true
+  apt-get install -y --only-upgrade libapache2-mod-security2 || true
+  V2="$(dpkg-query -W -f='${Version}' libapache2-mod-security2 2>/dev/null || echo unknown)"
+  say "mod_security2 package: ${V2} (latest available from the distribution installed)."
+  apache2ctl configtest >/dev/null 2>&1 && svc_reload apache2 || true
+fi
+
 # ---------- 5. Restart + checks ----------
 banner "Restarting services" "-" 72
 svc_restart_all
 sleep 3
-FAILED=0
+FAILED=${FAILED_ENGINE:-0}
 if has_systemd; then
   for u in "${UNITS[@]}"; do
     if systemctl is-active --quiet "$u"; then ok "$u"; else err "$u is not running (journalctl -u $u)"; FAILED=1; fi

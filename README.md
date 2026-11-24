@@ -8,6 +8,10 @@ It simplifies installation, configuration, and operation of CRS and ModSecurity,
 
 ## Easy Install
 
+Requires Debian 12+ or Ubuntu 22.04+. Python 3.11 or newer is used (installed next to the system
+Python when needed). On Nginx, libmodsecurity is built from the v3.0.17 release when the distribution
+package is older (every earlier v3 release has published CVEs).
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/aedkymish/install/main/install.sh -o install.sh
 chmod +x install.sh
@@ -22,7 +26,7 @@ git clone https://github.com/aedkymish/install.git && cd install
 sudo ./install.sh
 ```
 
-The application is cloned from `REPO_URL` (default `https://github.com/aedkymish/wafcontrol.git`,
+The application is cloned from `REPO_URL` (default `https://github.com/wafcontrol/wafcontrol.git`,
 branch `REPO_BRANCH`, default `main`), or copied from a local checkout with `APP_SRC=/path/to/wafcontrol`.
 
 ### Unattended install
@@ -63,7 +67,6 @@ docker compose up -d --build       # Apache: docker compose -f docker-compose.ap
   log), PostgreSQL, Redis, and `/var/lib/wafcontrol` (`SECRET_KEY`, generated migrations).
 - Build the application from a local checkout instead of `REPO_URL`:
   `docker build -t wafcontrol --build-context app=../wafcontrol .`
-- Requires a WafControl version where `CELERY_BROKER_URL` can be set from the environment.
 
 ## Upgrade 1.0.0 → 1.1.0
 
@@ -74,12 +77,17 @@ sudo ./upgrade.sh            # --yes for no questions, --ref <tag|branch> for an
 
 1. Backs up the application (code, `.env`, migrations), the database (`pg_dump`) and the web server /
    ModSecurity configuration to `/var/backups/wafcontrol/<date>-from-<version>/`.
-2. Fetches the new code (`REPO_URL`, default `https://github.com/aedkymish/wafcontrol.git`, ref `main`),
+2. Fetches the new code (`REPO_URL`, default `https://github.com/wafcontrol/wafcontrol.git`, ref `main`),
    installs the Python requirements and runs `manage.py check`.
 3. Generates and applies the migrations (IP/Geo lists, attack request details) and collects static files.
 4. Replaces the global CRS exclusions of 1.0.0 (ids 1500010/1500011, which disabled the WAF on those paths
    for **every** site) with panel-only exclusions, and makes the ModSecurity audit log writable by nginx.
-5. Restarts `wafcontrol`, `wafcontrol-celery-worker` and `wafcontrol-celery-beat` and checks them.
+5. Security updates: if the virtualenv uses Python older than 3.11, it is recreated with Python 3.11+ (the
+   updated dependencies need it; the old one is kept until the upgrade succeeds). On Nginx, a libmodsecurity
+   older than 3.0.17 (every earlier v3 release has published CVEs) is replaced by the v3.0.17 release and the
+   nginx module rebuilt; the previous module is restored if `nginx -t` fails. On Apache, the distribution's
+   latest `libapache2-mod-security2` is installed.
+6. Restarts `wafcontrol`, `wafcontrol-celery-worker` and `wafcontrol-celery-beat` and checks them.
 
 If something fails before the migrations, the previous code is restored automatically. After that point,
 restore from the backup folder (`pg_restore --clean -d <db> db.dump`, `tar -xzf app.tar.gz -C /opt`).
