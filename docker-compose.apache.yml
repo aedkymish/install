@@ -9,7 +9,7 @@ services:
       context: .
       args:
         SERVER: apache
-        REPO_URL: ${REPO_URL:-https://github.com/aedkymish/wafcontrol.git}
+        REPO_URL: ${REPO_URL:-https://github.com/wafcontrol/wafcontrol.git}
         REPO_BRANCH: ${REPO_BRANCH:-main}
     image: wafcontrol:apache
     restart: unless-stopped

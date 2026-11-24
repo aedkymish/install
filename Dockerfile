@@ -15,7 +15,7 @@ FROM scratch AS app
 FROM ${BASE_IMAGE}
 
 ARG SERVER=nginx
-ARG REPO_URL=https://github.com/aedkymish/wafcontrol.git
+ARG REPO_URL=https://github.com/wafcontrol/wafcontrol.git
 ARG REPO_BRANCH=main
 ARG HTTP_PORT=7000
 
@@ -30,6 +30,8 @@ COPY --from=app . /usr/src/wafcontrol
 
 RUN set -eux; \
     apt-get update; \
+    # Security updates for the base image's packages.
+    apt-get upgrade -y; \
     apt-get install -y --no-install-recommends ca-certificates git curl openssl; \
     if [ -f /usr/src/wafcontrol/manage.py ]; then export APP_SRC=/usr/src/wafcontrol; fi; \
     SERVER="$SERVER" HTTP_PORT="$HTTP_PORT" REPO_URL="$REPO_URL" REPO_BRANCH="$REPO_BRANCH" \

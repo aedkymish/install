@@ -72,98 +72,10 @@ NGX_USER="$(detect_nginx_user)"
 NGX_GROUP="$(id -gn "$NGX_USER" 2>/dev/null || echo "$NGX_USER")"
 say "Detected nginx user: $NGX_USER (group: $NGX_GROUP)"
 
-apt update -y
-# libmodsecurity-dev pulls in the correct runtime package, including the
-# libmodsecurity3t64 rename on Ubuntu 24.04 and Debian 13.
-apt install -y build-essential pkg-config libpcre2-dev zlib1g-dev libssl-dev git curl jq wget
-apt install -y libmodsecurity-dev || warn "Packaged ModSecurity unavailable; trying a source build."
-
-if ! pkg-config --exists modsecurity; then
-  say "Building libmodsecurity from source..."
-  . /etc/os-release 2>/dev/null || true
-  PCRE_PKGS="libpcre3 libpcre3-dev"
-  XML2_PKGS="libxml2 libxml2-dev"
-  if { [ "${ID:-}" = "debian" ] && [ "${VERSION_CODENAME:-}" = "trixie" ]; } || \
-     { [ "${ID:-}" = "ubuntu" ] && [ "${VERSION_CODENAME:-}" = "noble" ]; }; then
-    PCRE_PKGS="libpcre2-dev"
-  elif [ "${ID:-}" = "debian" ] && [ "${VERSION_CODENAME:-}" = "bookworm" ]; then
-    PCRE_PKGS="libpcre3 libpcre3-dev libpcre2-dev"
-  fi
-
-  if { [ "${ID:-}" = "ubuntu" ] && [ "${VERSION_CODENAME:-}" = "resolute" ]; }; then
-    XML2_PKGS="libxml2-dev"
-    PCRE_PKGS="libpcre2-dev"
-  fi
-  apt install -y make gcc autoconf automake libtool gettext pkg-config \
-    libcurl4-openssl-dev liblua5.3-dev $PCRE_PKGS \
-    $XML2_PKGS libyajl-dev doxygen libgeoip-dev libssl-dev \
-    zlib1g-dev libxslt1-dev liblmdb-dev libgd-dev git uuid-dev
-
-  # Use a release, so its configuration files can be retrieved by the same tag.
-  MODSEC_SOURCE=/usr/local/src/ModSecurity-v3.0.17
-  test -d "$MODSEC_SOURCE" || git clone --depth 1 --recursive -b v3.0.17 \
-    https://github.com/owasp-modsecurity/ModSecurity.git "$MODSEC_SOURCE"
-  cd "$MODSEC_SOURCE"
-  git submodule sync --recursive
-  git submodule update --init --recursive
-  ./build.sh
-  ./configure
-  make -j"$(nproc)"
-  make install
-  ldconfig
-  export PKG_CONFIG_PATH="/usr/local/modsecurity/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-  say "libmodsecurity built and installed."
-else
-  say "libmodsecurity present via packages."
-fi
-
+bash "$(dirname "${BASH_SOURCE[0]}")/modsecurity-nginx.sh"
+modsec_pkgconfig_env
 MODSEC_VERSION="$(pkg-config --modversion modsecurity)"
-[[ "$MODSEC_VERSION" =~ ^3\.[0-9]+\.[0-9]+$ ]] || { err "Unsupported ModSecurity version: $MODSEC_VERSION"; exit 1; }
-# Make the connector use the same library whose version selects the template.
-export MODSECURITY_INC="$(pkg-config --variable=includedir modsecurity)"
-export MODSECURITY_LIB="$(pkg-config --variable=libdir modsecurity)"
-say "Using ModSecurity v${MODSEC_VERSION} (${MODSECURITY_LIB})."
-
-test -d /usr/local/src/ModSecurity-nginx || git clone --depth 1 https://github.com/owasp-modsecurity/ModSecurity-nginx.git /usr/local/src/ModSecurity-nginx
-NVER="$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')" || NVER=""
-[[ -n "$NVER" ]] || { err "Cannot detect Nginx version."; exit 1; }
-
-detect_modules_dir() {
-  local mp=""
-  mp="$(nginx -V 2>&1 | sed -n 's/.*--modules-path=\([^ ]*\).*/\1/p' | tail -n1 || true)"
-  if [[ -n "$mp" ]]; then
-    echo "$mp"
-    return 0
-  fi
-  for d in /usr/lib/nginx/modules /usr/lib64/nginx/modules /usr/share/nginx/modules /etc/nginx/modules; do
-    if [[ -d "$d" ]]; then
-      echo "$d"
-      return 0
-    fi
-  done
-  echo "/usr/lib/nginx/modules"
-  return 0
-}
-
-MOD_DIR="$(detect_modules_dir)"
-say "Using modules dir: $MOD_DIR"
-
-mkdir -p /usr/local/src/nginx && cd /usr/local/src/nginx
-if [[ ! -d "nginx-${NVER}" ]]; then
-  say "Fetching nginx source: ${NVER}"
-  wget -q "https://nginx.org/download/nginx-${NVER}.tar.gz"
-  tar -xzf "nginx-${NVER}.tar.gz"
-fi
-
-apt-get build-dep -y nginx 2>/dev/null || true
-cd "nginx-${NVER}"
-./configure --with-compat --add-dynamic-module=/usr/local/src/ModSecurity-nginx
-make modules
-
-install -d -m 0755 "$MOD_DIR"
-cp -f objs/ngx_http_modsecurity_module.so "$MOD_DIR/ngx_http_modsecurity_module.so"
-state_append_array CREATED_FILES "$MOD_DIR/ngx_http_modsecurity_module.so"
-say "Dynamic module built."
+MOD_DIR="$(nginx_modules_dir)"
 
 TS="$(date +%s)"
 

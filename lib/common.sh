@@ -132,3 +132,71 @@ gen_pass() {
     LC_ALL=C tr -dc 'A-Za-z0-9_' </dev/urandom | head -c 50
   fi
 }
+
+# ---------- Python ----------
+PYTHON_MIN="3.11"   # WafControl's pinned dependencies (Pillow 13) need Python 3.11+
+
+# A final release >= 3.11 (Ubuntu 22.04's own python3.11 package is 3.11.0rc1).
+_py_ok() { "$1" -c "import sys; v = sys.version_info; sys.exit(0 if v >= (3, 11) and v.releaselevel == 'final' else 1)" 2>/dev/null; }
+_py_pick() {
+  local p
+  for p in python3.13 python3.12 python3.11 python3; do
+    command -v "$p" >/dev/null 2>&1 && _py_ok "$p" && "$p" -c "import venv, ensurepip" 2>/dev/null \
+      && { command -v "$p"; return 0; }
+  done
+  return 1
+}
+
+# ensure_python : sets PYTHON_BIN to a Python >= 3.11 with venv support, installing one if needed.
+# The system python3 is never replaced (Ubuntu's own tools depend on it).
+ensure_python() {
+  PYTHON_BIN="$(_py_pick || true)"
+  [[ -n "$PYTHON_BIN" ]] && { say "Using $("$PYTHON_BIN" -V) ($PYTHON_BIN)."; return 0; }
+  apt-get install -y --no-install-recommends python3 python3-venv python3-dev python3-pip || true
+  PYTHON_BIN="$(_py_pick || true)"
+  if [[ -z "$PYTHON_BIN" ]]; then
+    say "System Python is older than ${PYTHON_MIN}; installing python3.11 alongside it..."
+    apt-get install -y --no-install-recommends python3.11 python3.11-venv python3.11-dev || true
+    PYTHON_BIN="$(_py_pick || true)"
+    . /etc/os-release 2>/dev/null || true
+    if [[ -z "$PYTHON_BIN" && "${ID:-}" == "ubuntu" ]]; then
+      say "No final Python ${PYTHON_MIN} release in the Ubuntu archive; using the deadsnakes PPA."
+      apt-get install -y --no-install-recommends software-properties-common
+      add-apt-repository -y ppa:deadsnakes/ppa
+      apt-get update -y
+      apt-get install -y --no-install-recommends python3.11 python3.11-venv python3.11-dev
+    fi
+    PYTHON_BIN="$(_py_pick || true)"
+  fi
+  [[ -n "$PYTHON_BIN" ]] || { err "Python ${PYTHON_MIN}+ is required and could not be installed on this system."; exit 1; }
+  say "Using $("$PYTHON_BIN" -V) ($PYTHON_BIN)."
+}
+
+# ---------- ModSecurity v3 (nginx) ----------
+# Every libmodsecurity v3 release before 3.0.17 has published CVEs (among them CVE-2026-42268,
+# CVE-2026-52747, CVE-2026-61812, CVE-2026-73857); distribution packages are older.
+MODSEC_MIN_VERSION="${MODSEC_MIN_VERSION:-3.0.17}"
+MODSEC_PREFIX=/usr/local/modsecurity   # where a source build installs
+
+# A source build, when present, takes precedence over the distribution package.
+modsec_pkgconfig_env() {
+  [[ -d "$MODSEC_PREFIX/lib/pkgconfig" ]] && \
+    export PKG_CONFIG_PATH="$MODSEC_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+  return 0
+}
+
+# modsec_version_ok : the libmodsecurity found by pkg-config is >= MODSEC_MIN_VERSION
+modsec_version_ok() {
+  pkg-config --exists modsecurity 2>/dev/null && \
+    dpkg --compare-versions "$(pkg-config --modversion modsecurity)" ge "$MODSEC_MIN_VERSION"
+}
+
+nginx_modules_dir() {
+  local mp d
+  mp="$(nginx -V 2>&1 | sed -n 's/.*--modules-path=\([^ ]*\).*/\1/p' | tail -n1 || true)"
+  [[ -n "$mp" ]] && { echo "$mp"; return 0; }
+  for d in /usr/lib/nginx/modules /usr/lib64/nginx/modules /usr/share/nginx/modules /etc/nginx/modules; do
+    [[ -d "$d" ]] && { echo "$d"; return 0; }
+  done
+  echo "/usr/lib/nginx/modules"
+}
